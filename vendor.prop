@@ -72,6 +72,9 @@ persist.device_config.mglru_native.lru_gen_config=core
 # Storage
 persist.sys.fuse.backup.external_volume_backup=false
 
+# USB
+sys.usb.controller=1000480000.usb
+
 # Wifi
 wifi.interface=wlan0
 

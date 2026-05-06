@@ -27,4 +27,4 @@ dtoverlay=vc4-kms-v3d
 #dtparam=spi=on
 
 # USB
-dtoverlay=dwc2,dr_mode=peripheral
+dtoverlay=dwc2,dr_mode=otg
