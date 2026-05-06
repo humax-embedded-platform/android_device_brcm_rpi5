@@ -60,10 +60,6 @@
 int pcm_card;
 int pcm_device;
 
-struct stub_stream_in {
-    struct audio_stream_in stream;
-};
-
 struct alsa_audio_device {
     struct audio_hw_device hw_device;
 
@@ -86,6 +82,73 @@ struct alsa_stream_out {
     int write_threshold;
     unsigned int written;
 };
+
+struct alsa_stream_in {
+    struct audio_stream_in stream;
+
+    pthread_mutex_t lock;   /* see note below on mutex acquisition order */
+    struct pcm_config config;
+    struct pcm *pcm;
+    bool unavailable;
+    int standby;
+    struct alsa_audio_device *dev;
+    unsigned int read_frames;
+    audio_devices_t device;
+};
+
+struct pcm_config in_config = {
+    .channels = CHANNEL_STEREO,
+    .rate = 48000,
+    .format = PCM_FORMAT_S16_LE,
+    .period_size = PERIOD_SIZE,
+    .period_count = 8,
+    .start_threshold = 1,
+};
+
+static int get_pcm_card();
+static int get_pcm_device();
+static int do_input_standby(struct alsa_stream_in *in);
+static int do_output_standby(struct alsa_stream_out *out);
+static int get_input_pcm_device(audio_devices_t device);
+
+static int get_input_pcm_card(audio_devices_t device)
+{
+    if (device & AUDIO_DEVICE_IN_HDMI) {
+        return 3;
+    }
+    return get_pcm_card();
+}
+
+static int start_input_stream(struct alsa_stream_in *in) {
+    struct alsa_audio_device *adev = in->dev;
+
+    if(in->unavailable)
+        return -ENODEV;
+
+    int card = get_input_pcm_card(in->device);
+    int device = get_input_pcm_device(in->device);
+
+    in->pcm = pcm_open(card, device, PCM_IN, &in->config);
+    if(!pcm_is_ready(in->pcm)) {
+        ALOGE("cannot open pcm_in driver: %s", pcm_get_error(in->pcm));
+        pcm_close(in->pcm);
+        in->pcm         = NULL;
+        in->unavailable = true;
+        return -ENODEV;
+    }
+
+    adev->active_input = in;
+    ALOGI("Opened PCM card %d device %d for input", card, device);
+    return 0;
+}
+
+static int get_input_pcm_device(audio_devices_t device)
+{
+    if (device & AUDIO_DEVICE_IN_HDMI) {
+        return 0;
+    }
+    return get_pcm_device();
+}
 
 static int probe_pcm_out_card() {
     FILE *fp;
@@ -388,8 +451,8 @@ static int out_get_next_write_timestamp(const struct audio_stream_out *stream,
 /** audio_stream_in implementation **/
 static uint32_t in_get_sample_rate(const struct audio_stream *stream)
 {
-    ALOGV("in_get_sample_rate");
-    return 8000;
+    struct alsa_stream_in *in = (struct alsa_stream_in *)stream;
+    return in->config.rate ? in->config.rate : 48000;
 }
 
 static int in_set_sample_rate(struct audio_stream *stream, uint32_t rate)
@@ -400,14 +463,16 @@ static int in_set_sample_rate(struct audio_stream *stream, uint32_t rate)
 
 static size_t in_get_buffer_size(const struct audio_stream *stream)
 {
-    ALOGV("in_get_buffer_size: %d", 320);
-    return 320;
+    struct alsa_stream_in *in = (struct alsa_stream_in *)stream;
+    size_t period = in->config.period_size ? in->config.period_size : PERIOD_SIZE;
+    size_t size = ((period + 15) / 16) * 16;
+    return size * audio_stream_in_frame_size((struct audio_stream_in *)stream);
 }
 
 static audio_channel_mask_t in_get_channels(const struct audio_stream *stream)
 {
-    ALOGV("in_get_channels: %d", AUDIO_CHANNEL_IN_MONO);
-    return AUDIO_CHANNEL_IN_MONO;
+    struct alsa_stream_in *in = (struct alsa_stream_in *)stream;
+    return audio_channel_in_mask_from_count(in->config.channels);
 }
 
 static audio_format_t in_get_format(const struct audio_stream *stream)
@@ -422,7 +487,13 @@ static int in_set_format(struct audio_stream *stream, audio_format_t format)
 
 static int in_standby(struct audio_stream *stream)
 {
-    return 0;
+    struct alsa_stream_in *in = (struct alsa_stream_in *)stream;
+    pthread_mutex_lock(&in->dev->lock);
+    pthread_mutex_lock(&in->lock);
+    int status = do_input_standby(in);
+    pthread_mutex_unlock(&in->lock);
+    pthread_mutex_unlock(&in->dev->lock);
+    return status;
 }
 
 static int in_dump(const struct audio_stream *stream, int fd)
@@ -449,12 +520,48 @@ static int in_set_gain(struct audio_stream_in *stream, float gain)
 static ssize_t in_read(struct audio_stream_in *stream, void* buffer,
         size_t bytes)
 {
-    ALOGV("in_read: bytes %zu", bytes);
-    /* XXX: fake timing for audio input */
-    usleep((int64_t)bytes * 1000000 / audio_stream_in_frame_size(stream) /
-            in_get_sample_rate(&stream->common));
-    memset(buffer, 0, bytes);
+    struct alsa_stream_in *in = (struct alsa_stream_in *)stream;
+    struct alsa_audio_device *adev = in->dev;
+    size_t frame_size = audio_stream_in_frame_size(stream);
+    ssize_t ret = 0;
+    ALOGV("in_read: bytes=%zu", bytes);
+    pthread_mutex_lock(&adev->lock);
+    pthread_mutex_lock(&in->lock);
+
+    if(in->standby) {
+        ret = start_input_stream(in);
+        if(ret != 0) {
+            pthread_mutex_unlock(&adev->lock);
+            goto exit;
+        }
+        in->standby = 0;
+    }
+    pthread_mutex_unlock(&adev->lock);
+
+    size_t in_frames = bytes / frame_size;
+    ret = pcm_read(in->pcm, buffer, in_frames * frame_size);
+    if (ret == 0) 
+        in->read_frames += in_frames;
+exit:
+    pthread_mutex_unlock(&in->lock);
+
+    if(ret != 0) {
+        usleep((int64_t)bytes * 1000000 / frame_size /
+                in_get_sample_rate(&stream->common));
+        memset(buffer, 0, bytes);
+    }
     return bytes;
+}
+
+static int do_input_standby(struct alsa_stream_in *in)
+{
+    if (!in->standby) {
+        pcm_close(in->pcm);
+        in->pcm = NULL;
+        in->dev->active_input = NULL;
+        in->standby = 1;
+    }
+    return 0;
 }
 
 static uint32_t in_get_input_frames_lost(struct audio_stream_in *stream)
@@ -625,11 +732,15 @@ static int adev_get_mic_mute(const struct audio_hw_device *dev, bool *state)
 static size_t adev_get_input_buffer_size(const struct audio_hw_device *dev,
         const struct audio_config *config)
 {
-    ALOGV("adev_get_input_buffer_size: %d", 320);
-    return 320;
+    size_t frame_size = audio_bytes_per_sample(config->format) *
+                        popcount(config->channel_mask);
+    size_t frames = PERIOD_SIZE;
+    size_t buf_size = frames * frame_size;
+    ALOGV("adev_get_input_buffer_size: %zu", buf_size);
+    return buf_size;
 }
 
-static int adev_open_input_stream(struct audio_hw_device __unused *dev,
+static int adev_open_input_stream(struct audio_hw_device *dev,
         audio_io_handle_t handle,
         audio_devices_t devices,
         struct audio_config *config,
@@ -638,13 +749,14 @@ static int adev_open_input_stream(struct audio_hw_device __unused *dev,
         const char *address __unused,
         audio_source_t source __unused)
 {
-    struct stub_stream_in *in;
+    struct alsa_audio_device *ladev = (struct alsa_audio_device *)dev;
+    struct alsa_stream_in *in;
 
-    ALOGV("adev_open_input_stream...");
-
-    in = (struct stub_stream_in *)calloc(1, sizeof(struct stub_stream_in));
+    in = (struct alsa_stream_in *)calloc(1, sizeof(*in));
     if (!in)
         return -ENOMEM;
+
+    ALOGV("adev_open_input_stream...");
 
     in->stream.common.get_sample_rate = in_get_sample_rate;
     in->stream.common.set_sample_rate = in_set_sample_rate;
@@ -662,15 +774,29 @@ static int adev_open_input_stream(struct audio_hw_device __unused *dev,
     in->stream.read = in_read;
     in->stream.get_input_frames_lost = in_get_input_frames_lost;
 
+    in->device = devices;
+    in->dev = ladev;
+    in->standby = 1;
+    in->config = in_config;
+
+    if(in->device & AUDIO_DEVICE_IN_HDMI) {
+        in->config.period_size = 256;
+    }
+
+    config->sample_rate = 48000;
+    config->channel_mask = AUDIO_CHANNEL_IN_STEREO;
+    config->format = AUDIO_FORMAT_PCM_16_BIT;
+
     *stream_in = &in->stream;
     return 0;
 }
 
 static void adev_close_input_stream(struct audio_hw_device *dev,
-        struct audio_stream_in *in)
+        struct audio_stream_in *stream)
 {
-    ALOGV("adev_close_input_stream...");
-    return;
+    struct alsa_stream_in *in = (struct alsa_stream_in *)stream;
+    int status = do_input_standby(in);
+    free(in);
 }
 
 static int adev_dump(const audio_hw_device_t *device, int fd)

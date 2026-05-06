@@ -16,6 +16,7 @@
             <attachedDevices>
                 <item>Speaker</item>
                 <item>Built-In Mic</item>
+                <item>HDMI In</item>
             </attachedDevices>
             <defaultOutputDevice>Speaker</defaultOutputDevice>
             <mixPorts>
@@ -28,6 +29,11 @@
                     <profile name="" format="AUDIO_FORMAT_PCM_16_BIT"
                              samplingRates="8000 11025 12000 16000 22050 24000 32000 44100 48000"
                              channelMasks="AUDIO_CHANNEL_IN_MONO AUDIO_CHANNEL_IN_STEREO"/>
+                </mixPort>
+                <mixPort name="hdmi-in" role="sink">
+                    <profile name="" format="AUDIO_FORMAT_PCM_16_BIT"
+                             samplingRates="48000"
+                             channelMasks="AUDIO_CHANNEL_IN_STEREO"/>
                 </mixPort>
             </mixPorts>
             <devicePorts>
@@ -76,6 +82,11 @@
                              samplingRates="8000 16000"
                              channelMasks="AUDIO_CHANNEL_IN_MONO"/>
                 </devicePort>
+                <devicePort tagName="HDMI In" type="AUDIO_DEVICE_IN_HDMI" role="source">
+                    <profile name="" format="AUDIO_FORMAT_PCM_16_BIT"
+                             samplingRates="48000"
+                             channelMasks="AUDIO_CHANNEL_IN_STEREO"/>
+                </devicePort>
             </devicePorts>
             <routes>
                 <route type="mix" sink="Speaker"
@@ -92,6 +103,8 @@
                        sources="primary output"/>
                 <route type="mix" sink="primary input"
                        sources="Built-In Mic,Wired Headset Mic,BT SCO Headset Mic"/>
+                <route type="mix" sink="hdmi-in"
+                       sources="HDMI In"/>
             </routes>
         </module>
 
