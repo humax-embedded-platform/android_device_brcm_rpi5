@@ -781,6 +781,7 @@ static int adev_open_input_stream(struct audio_hw_device *dev,
 
     if(in->device & AUDIO_DEVICE_IN_HDMI) {
         in->config.period_size = 256;
+        in->config.start_threshold = 256*8;
     }
 
     config->sample_rate = 48000;
