@@ -5,7 +5,7 @@ kernel=Image
 initramfs ramdisk.img followkernel
 
 # Camera
-camera_auto_detect=1
+#camera_auto_detect=1
 
 # Display
 disable_overscan=1
@@ -16,6 +16,10 @@ disable_overscan=1
 
 # Graphics acceleration
 dtoverlay=vc4-kms-v3d
+
+# HDMI to CSI
+dtoverlay=tc358743
+dtoverlay=tc358743-audio
 
 # I2C
 #dtparam=i2c_arm=on
