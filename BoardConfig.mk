@@ -44,6 +44,7 @@ BOARD_CUSTOM_BOOTIMG := true
 BOARD_CUSTOM_BOOTIMG_MK := $(DEVICE_PATH)/mkbootimg.mk
 #BOARD_KERNEL_CMDLINE := console=ttyAMA10,115200 no_console_suspend root=/dev/ram0 rootwait androidboot.hardware=rpi5
 BOARD_KERNEL_CMDLINE := console=ttyAMA10,115200 netconsole=6666@192.168.0.5/eth0,6666@192.168.0.99/e8:cf:83:9c:ea:ac no_console_suspend loglevel=8 root=/dev/ram0 rootwait androidboot.hardware=rpi5
+#command to view netconsole: nc -u -l 6666 | tee /tmp/kernel_crash.log
 
 # Manifest
 DEVICE_FRAMEWORK_COMPATIBILITY_MATRIX_FILE := $(DEVICE_PATH)/framework_compatibility_matrix.xml
