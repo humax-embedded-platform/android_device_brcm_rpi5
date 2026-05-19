@@ -1,4 +1,1 @@
 gpu_access(platform_app)
-
-# Allow MaruCarPlay (platform_app) to write HU mic PCM to the injection FIFO.
-allow platform_app hu_mic_device:fifo_file { open write getattr };
