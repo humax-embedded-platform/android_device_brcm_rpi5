@@ -16,7 +16,15 @@
  */
 
 #define LOG_TAG "audio_hw_rpi"
-//#define LOG_NDEBUG 0
+#define LOG_NDEBUG 0
+
+/* Rate-limited log: prints every N calls. Use for hot-path functions. */
+#define ALOG_RATELIMIT(n, tag, fmt, ...) \
+    do { \
+        static unsigned _rl_ctr = 0; \
+        if ((_rl_ctr++ % (n)) == 0) \
+            ALOGD("[%s #%u] " fmt, tag, _rl_ctr, ##__VA_ARGS__); \
+    } while (0)
 
 #include <errno.h>
 #include <fcntl.h>
@@ -132,7 +140,7 @@ static int get_input_pcm_device(audio_devices_t device);
 
 static int get_input_pcm_card(audio_devices_t device)
 {
-    if (device & AUDIO_DEVICE_IN_HDMI) {
+    if ((device & AUDIO_DEVICE_IN_HDMI) == AUDIO_DEVICE_IN_HDMI) {
         return 3;
     }
     return get_pcm_card();
@@ -141,29 +149,59 @@ static int get_input_pcm_card(audio_devices_t device)
 static int start_input_stream(struct alsa_stream_in *in) {
     struct alsa_audio_device *adev = in->dev;
 
-    if(in->unavailable)
-        return -ENODEV;
+    ALOGD("start_input_stream: device=0x%08x unavailable=%d standby=%d",
+          in->device, in->unavailable, in->standby);
 
-    int card = get_input_pcm_card(in->device);
-    int device = get_input_pcm_device(in->device);
-
-    in->pcm = pcm_open(card, device, PCM_IN, &in->config);
-    if(!pcm_is_ready(in->pcm)) {
-        ALOGE("cannot open pcm_in driver: %s", pcm_get_error(in->pcm));
-        pcm_close(in->pcm);
-        in->pcm         = NULL;
-        in->unavailable = true;
+    if(in->unavailable) {
         return -ENODEV;
     }
 
+    if ((in->device & AUDIO_DEVICE_IN_HDMI) == AUDIO_DEVICE_IN_HDMI) {
+        int card = get_input_pcm_card(in->device);
+        int device = get_input_pcm_device(in->device);
+
+        ALOGD("start_input_stream: HDMI path -> card=%d device=%d "
+              "rate=%u ch=%d fmt=%d period=%u",
+              card, device,
+              in->config.rate, in->config.channels, in->config.format,
+              in->config.period_size);
+
+        in->pcm = pcm_open(card, device, PCM_IN, &in->config);
+        if(!pcm_is_ready(in->pcm)) {
+            ALOGE("start_input_stream: cannot open pcm_in card=%d device=%d: %s",
+                  card, device, pcm_get_error(in->pcm));
+            pcm_close(in->pcm);
+            in->pcm         = NULL;
+            in->unavailable = true;
+            return -ENODEV;
+        }
+        ALOGI("start_input_stream: opened HDMI PCM card=%d device=%d", card, device);
+    } else {
+        ALOGD("start_input_stream: HU mic path, current fd=%d", adev->hu_mic_fd);
+        if (adev->hu_mic_fd < 0) {
+            adev->hu_mic_fd = open(HU_MIC_FIFO_PATH, O_RDONLY | O_NONBLOCK);
+            if (adev->hu_mic_fd < 0)
+                ALOGE("start_input_stream: failed to open %s: %s",
+                      HU_MIC_FIFO_PATH, strerror(errno));
+            else
+                ALOGI("start_input_stream: opened HU mic FIFO %s fd=%d",
+                      HU_MIC_FIFO_PATH, adev->hu_mic_fd);
+        } else {
+            ALOGD("start_input_stream: HU mic FIFO already open fd=%d", adev->hu_mic_fd);
+        }
+        ALOGD("start_input_stream: ring buf wr=%u rd=%u avail=%u",
+              adev->hu_mic_wr, adev->hu_mic_rd,
+              adev->hu_mic_wr - adev->hu_mic_rd);
+    }
+
     adev->active_input = in;
-    ALOGI("Opened PCM card %d device %d for input", card, device);
+    ALOGD("start_input_stream: done, active_input=%p", (void *)adev->active_input);
     return 0;
 }
 
 static int get_input_pcm_device(audio_devices_t device)
 {
-    if (device & AUDIO_DEVICE_IN_HDMI) {
+    if ((device & AUDIO_DEVICE_IN_HDMI) == AUDIO_DEVICE_IN_HDMI) {
         return 0;
     }
     return get_pcm_device();
@@ -233,10 +271,20 @@ static int start_output_stream(struct alsa_stream_out *out)
     out->config.start_threshold = PLAYBACK_PERIOD_START_THRESHOLD * PERIOD_SIZE;
     out->config.avail_min = PERIOD_SIZE;
 
-    out->pcm = pcm_open(pcm_card, pcm_device, PCM_OUT | PCM_MMAP | PCM_NOIRQ | PCM_MONOTONIC, &out->config);
+    int _out_card = pcm_card;
+    int _out_dev  = pcm_device;
+    ALOGD("start_output_stream: opening PCM card=%d device=%d "
+          "rate=%u ch=%d fmt=%d period=%u count=%u thresh=%d",
+          _out_card, _out_dev,
+          out->config.rate, out->config.channels, out->config.format,
+          out->config.period_size, out->config.period_count,
+          out->config.start_threshold);
+
+    out->pcm = pcm_open(_out_card, _out_dev, PCM_OUT | PCM_MMAP | PCM_NOIRQ | PCM_MONOTONIC, &out->config);
 
     if (!pcm_is_ready(out->pcm)) {
-        ALOGE("cannot open pcm_out driver: %s", pcm_get_error(out->pcm));
+        ALOGE("start_output_stream: cannot open PCM card=%d device=%d: %s",
+              _out_card, _out_dev, pcm_get_error(out->pcm));
         pcm_close(out->pcm);
         adev->active_output = NULL;
         out->unavailable = true;
@@ -402,9 +450,13 @@ static ssize_t out_write(struct audio_stream_out *stream, const void* buffer,
 
     pthread_mutex_unlock(&adev->lock);
 
+    ALOG_RATELIMIT(200, "out_write", "frames=%zu written_total=%u", out_frames, out->written);
     ret = pcm_mmap_write(out->pcm, buffer, out_frames * frame_size);
     if (ret == 0) {
         out->written += out_frames;
+    } else {
+        ALOGE("out_write: pcm_mmap_write failed: %s (frames=%zu)",
+              pcm_get_error(out->pcm), out_frames);
     }
 exit:
     pthread_mutex_unlock(&out->lock);
@@ -543,7 +595,7 @@ static ssize_t in_read(struct audio_stream_in *stream, void* buffer,
     struct alsa_audio_device *adev = in->dev;
     size_t frame_size = audio_stream_in_frame_size(stream);
     ssize_t ret = 0;
-    ALOGV("in_read: bytes=%zu", bytes);
+    ALOG_RATELIMIT(300, "in_read", "bytes=%zu", bytes);
     pthread_mutex_lock(&adev->lock);
     pthread_mutex_lock(&in->lock);
 
@@ -559,66 +611,78 @@ static ssize_t in_read(struct audio_stream_in *stream, void* buffer,
 
     size_t in_frames = bytes / frame_size;
 
-    /* ---- HU mic injection ------------------------------------------ */
-    /* Step 1: Drain the FIFO into the ring buffer (non-blocking). */
-    if (adev->hu_mic_fd >= 0) {
-        uint8_t tmp[512];
-        ssize_t n;
-        while (1) {
-            uint32_t avail_space = HU_MIC_BUF_SIZE -
-                    (adev->hu_mic_wr - adev->hu_mic_rd);
-            if (avail_space == 0) break;
-            size_t to_read = avail_space < sizeof(tmp) ? avail_space : sizeof(tmp);
-            n = read(adev->hu_mic_fd, tmp, to_read);
-            if (n <= 0) {
-                if (n < 0 && errno != EAGAIN && errno != EWOULDBLOCK) {
-                    /* Writer disconnected ΓÇö try to reopen for next connection */
-                    close(adev->hu_mic_fd);
-                    adev->hu_mic_fd = open(HU_MIC_FIFO_PATH,
-                                           O_RDONLY | O_NONBLOCK);
-                    ALOGD("hu_mic: pipe closed, reopened fd=%d", adev->hu_mic_fd);
-                }
-                break;
-            }
-            for (ssize_t i = 0; i < n; i++)
-                adev->hu_mic_buf[(adev->hu_mic_wr++) & HU_MIC_BUF_MASK] = tmp[i];
-        }
-    }
+    // case HDIM
+    if ((in->device & AUDIO_DEVICE_IN_HDMI) == AUDIO_DEVICE_IN_HDMI) {
+        ret = pcm_read(in->pcm, buffer, in_frames * frame_size);
+        if (ret != 0 && in->pcm)
+            ALOGE("in_read: pcm_read failed: %s", pcm_get_error(in->pcm));
 
-    /* Step 2: If ring buffer has >= in_frames bytes of 24 kHz mono,
-     * upsample to 48 kHz stereo and overwrite the ALSA buffer. */
-    uint32_t hu_avail = adev->hu_mic_wr - adev->hu_mic_rd;
-    if (hu_avail >= (uint32_t)in_frames) {
-        /* Each input sample (24 kHz mono) ΓåÆ 2 output frames ├ù 2 ch = 4 s16s */
-        int16_t *out16 = (int16_t *)buffer;
-        size_t input_samples = in_frames / 2; /* = in_frames/2 @ 24kHz */
-        for (size_t i = 0; i < input_samples; i++) {
-            uint8_t lo = adev->hu_mic_buf[(adev->hu_mic_rd++) & HU_MIC_BUF_MASK];
-            uint8_t hi = adev->hu_mic_buf[(adev->hu_mic_rd++) & HU_MIC_BUF_MASK];
-            int16_t s = (int16_t)(lo | ((uint16_t)hi << 8));
-            /* Gain boost: HU mic signal is very quiet (~1% full-scale).
-             * Amplify 20x (~26 dB) to bring speech into recognisable range. */
-            int32_t s_amp = (int32_t)s * 20;
-            if      (s_amp >  32767) s_amp =  32767;
-            else if (s_amp < -32768) s_amp = -32768;
-            s = (int16_t)s_amp;
-            /* Duplicate to 2 output frames (zero-order hold), stereo */
-            size_t j = i * 4;
-            out16[j + 0] = s;  /* frame 0, L */
-            out16[j + 1] = s;  /* frame 0, R */
-            out16[j + 2] = s;  /* frame 1, L */
-            out16[j + 3] = s;  /* frame 1, R */
+    } else {
+        /* ---- HU mic injection ------------------------------------------ */
+        /* Step 1: Drain the FIFO into the ring buffer (non-blocking). */
+        if (adev->hu_mic_fd >= 0) {
+            uint8_t tmp[512];
+            ssize_t n;
+            while (1) {
+                uint32_t avail_space = HU_MIC_BUF_SIZE -
+                        (adev->hu_mic_wr - adev->hu_mic_rd);
+                if (avail_space == 0) break;
+                size_t to_read = avail_space < sizeof(tmp) ? avail_space : sizeof(tmp);
+                n = read(adev->hu_mic_fd, tmp, to_read);
+                if (n <= 0) {
+                    if (n < 0 && errno != EAGAIN && errno != EWOULDBLOCK) {
+                        /* Writer disconnected — try to reopen for next connection */
+                        close(adev->hu_mic_fd);
+                        adev->hu_mic_fd = open(HU_MIC_FIFO_PATH,
+                                            O_RDONLY | O_NONBLOCK);
+                        ALOGD("hu_mic: pipe closed, reopened fd=%d", adev->hu_mic_fd);
+                    }
+                    break;
+                }
+                for (ssize_t i = 0; i < n; i++)
+                    adev->hu_mic_buf[(adev->hu_mic_wr++) & HU_MIC_BUF_MASK] = tmp[i];
+            }
+        }
+
+        /* Step 2: If ring buffer has >= in_frames bytes of 24 kHz mono,
+        * upsample to 48 kHz stereo and overwrite the ALSA buffer. */
+        uint32_t hu_avail = adev->hu_mic_wr - adev->hu_mic_rd;
+        ALOG_RATELIMIT(100, "in_read",
+                    "hu_mic fd=%d avail=%u in_frames=%zu buf_fill=%.1f%%",
+                    adev->hu_mic_fd, hu_avail, in_frames,
+                    100.0f * hu_avail / HU_MIC_BUF_SIZE);
+        if (hu_avail >= (uint32_t)in_frames) {
+            /* Each input sample (24 kHz mono) -> 2 output frames x 2 ch = 4 s16s */
+            int16_t *out16 = (int16_t *)buffer;
+            size_t input_samples = in_frames / 2; /* = in_frames/2 @ 24kHz */
+            for (size_t i = 0; i < input_samples; i++) {
+                uint8_t lo = adev->hu_mic_buf[(adev->hu_mic_rd++) & HU_MIC_BUF_MASK];
+                uint8_t hi = adev->hu_mic_buf[(adev->hu_mic_rd++) & HU_MIC_BUF_MASK];
+                int16_t s = (int16_t)(lo | ((uint16_t)hi << 8));
+                /* Gain boost: HU mic signal is very quiet (~1% full-scale).
+                * Amplify 20x (~26 dB) to bring speech into recognisable range. */
+                int32_t s_amp = (int32_t)s * 20;
+                if      (s_amp >  32767) s_amp =  32767;
+                else if (s_amp < -32768) s_amp = -32768;
+                s = (int16_t)s_amp;
+                /* Duplicate to 2 output frames (zero-order hold), stereo */
+                size_t j = i * 4;
+                out16[j + 0] = s;  /* frame 0, L */
+                out16[j + 1] = s;  /* frame 0, R */
+                out16[j + 2] = s;  /* frame 1, L */
+                out16[j + 3] = s;  /* frame 1, R */
+            }
+            ret = 0;
+        } else {
+            /* No FIFO data — (returns silence). */
+            ALOG_RATELIMIT(300, "in_read", "HU mic starved (avail=%u < need=%zu), pcm_read fallback",
+                        hu_avail, in_frames);
+            ret = -1;
         }
         /* Rate-limit to real time: in_frames @ 48 kHz */
         usleep((long)in_frames * 1000000L / CODEC_SAMPLING_RATE);
-        ret = 0;
-    } else {
-        /* No FIFO data — fall back to hardware pcm_read() (returns silence). */
-        ret = pcm_read(in->pcm, buffer, in_frames * frame_size);
     }
-    /* ---------------------------------------------------------------- */
-    if (ret == 0)
-        in->read_frames += in_frames;
+
 exit:
     pthread_mutex_unlock(&in->lock);
 
@@ -633,8 +697,11 @@ exit:
 static int do_input_standby(struct alsa_stream_in *in)
 {
     if (!in->standby) {
-        pcm_close(in->pcm);
-        in->pcm = NULL;
+        if (in->pcm) {
+            pcm_close(in->pcm);
+            in->pcm = NULL;
+        }
+        
         in->dev->active_input = NULL;
         in->standby = 1;
     }
@@ -856,7 +923,10 @@ static int adev_open_input_stream(struct audio_hw_device *dev,
     in->standby = 1;
     in->config = in_config;
 
-    if(in->device & AUDIO_DEVICE_IN_HDMI) {
+    ALOGI("adev_open_input_stream: device=0x%08x rate=%u ch_mask=0x%x fmt=%d flags=0x%x",
+          devices, config->sample_rate, config->channel_mask, config->format, flags);
+
+    if ((in->device & AUDIO_DEVICE_IN_HDMI) == AUDIO_DEVICE_IN_HDMI) {
         in->config.period_size = 256;
         in->config.start_threshold = 256*8;
     }
@@ -939,7 +1009,7 @@ static int adev_open(const hw_module_t* module, const char* name,
 
     /* Open read end of the HU mic FIFO non-blocking.
      * The FIFO is created by init.rc at boot (as root). */
-    adev->hu_mic_fd = open(HU_MIC_FIFO_PATH, O_RDONLY | O_NONBLOCK);
+    adev->hu_mic_fd = -1;
     adev->hu_mic_wr = 0;
     adev->hu_mic_rd = 0;
     ALOGI("hu_mic: FIFO %s opened fd=%d", HU_MIC_FIFO_PATH, adev->hu_mic_fd);
