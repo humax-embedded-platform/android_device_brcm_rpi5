@@ -72,7 +72,7 @@ TARGET_NO_RECOVERY := true
 
 # SELinux
 BOARD_SEPOLICY_DIRS += device/brcm/rpi5/sepolicy
-BOARD_KERNEL_CMDLINE += androidboot.selinux=enforcing
+BOARD_KERNEL_CMDLINE += androidboot.selinux=permissive
 
 # Treble
 BOARD_VNDK_VERSION := current
