@@ -558,7 +558,6 @@ static ssize_t in_read(struct audio_stream_in *stream, void* buffer,
     pthread_mutex_unlock(&adev->lock);
 
     size_t in_frames = bytes / frame_size;
-    ret = pcm_read(in->pcm, buffer, in_frames * frame_size);
 
     /* ---- HU mic injection ------------------------------------------ */
     /* Step 1: Drain the FIFO into the ring buffer (non-blocking). */
@@ -597,6 +596,12 @@ static ssize_t in_read(struct audio_stream_in *stream, void* buffer,
             uint8_t lo = adev->hu_mic_buf[(adev->hu_mic_rd++) & HU_MIC_BUF_MASK];
             uint8_t hi = adev->hu_mic_buf[(adev->hu_mic_rd++) & HU_MIC_BUF_MASK];
             int16_t s = (int16_t)(lo | ((uint16_t)hi << 8));
+            /* Gain boost: HU mic signal is very quiet (~1% full-scale).
+             * Amplify 20x (~26 dB) to bring speech into recognisable range. */
+            int32_t s_amp = (int32_t)s * 20;
+            if      (s_amp >  32767) s_amp =  32767;
+            else if (s_amp < -32768) s_amp = -32768;
+            s = (int16_t)s_amp;
             /* Duplicate to 2 output frames (zero-order hold), stereo */
             size_t j = i * 4;
             out16[j + 0] = s;  /* frame 0, L */
@@ -604,7 +609,12 @@ static ssize_t in_read(struct audio_stream_in *stream, void* buffer,
             out16[j + 2] = s;  /* frame 1, L */
             out16[j + 3] = s;  /* frame 1, R */
         }
-        ret = 0; /* override any ALSA error */
+        /* Rate-limit to real time: in_frames @ 48 kHz */
+        usleep((long)in_frames * 1000000L / CODEC_SAMPLING_RATE);
+        ret = 0;
+    } else {
+        /* No FIFO data — fall back to hardware pcm_read() (returns silence). */
+        ret = pcm_read(in->pcm, buffer, in_frames * frame_size);
     }
     /* ---------------------------------------------------------------- */
     if (ret == 0)
