@@ -1,0 +1,11 @@
+# Audio HAL (hal_audio_default) ΓÇö HU mic FIFO permissions.
+# The HAL creates /dev/hu_mic at startup and reads PCM from it.
+allow hal_audio_default hu_mic_device:fifo_file
+    { create open read getattr setattr unlink };
+
+# Allow HAL to create a new file (the FIFO) inside /dev (labeled device:dir).
+allow hal_audio_default device:dir { write add_name remove_name };
+
+# Automatically label the created FIFO as hu_mic_device instead of
+# inheriting the parent directory's "device" type.
+type_transition hal_audio_default device:fifo_file hu_mic_device "hu_mic";

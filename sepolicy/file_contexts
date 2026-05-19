@@ -1,3 +1,6 @@
+# HU mic injection FIFO
+/dev/hu_mic                                                                  u:object_r:hu_mic_device:s0
+
 # Bluetooth
 /sys/class/rfkill/rfkill[0-9]/state                                          u:object_r:sysfs_bluetooth_writable:s0
 

@@ -1,1 +1,4 @@
 gpu_access(system_app)
+
+# Allow system_app to write HU mic PCM to the injection FIFO.
+allow system_app hu_mic_device:fifo_file { open write getattr };

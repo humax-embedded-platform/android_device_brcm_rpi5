@@ -19,9 +19,11 @@
 //#define LOG_NDEBUG 0
 
 #include <errno.h>
+#include <fcntl.h>
 #include <malloc.h>
 #include <pthread.h>
 #include <stdint.h>
+#include <sys/stat.h>
 #include <sys/time.h>
 #include <stdlib.h>
 #include <unistd.h>
@@ -46,6 +48,17 @@
 /* Minimum granularity - Arbitrary but small value */
 #define CODEC_BASE_FRAME_COUNT 32
 
+/* HU mic injection via named FIFO --------------------------------------- */
+#define HU_MIC_FIFO_PATH    "/dev/hu_mic"
+/* Ring buffer: power-of-2, holds ~16 periods of 24 kHz mono input.
+ * HU mic: 24 kHz mono s16-LE ΓåÆ 2 bytes/sample.
+ * One 48 kHz output period (PERIOD_SIZE frames, stereo) needs
+ * PERIOD_SIZE/2 input samples = PERIOD_SIZE bytes from this buffer. */
+#define HU_MIC_BUF_BITS     14
+#define HU_MIC_BUF_SIZE     (1u << HU_MIC_BUF_BITS)  /* 16384 bytes */
+#define HU_MIC_BUF_MASK     (HU_MIC_BUF_SIZE - 1u)
+/* ------------------------------------------------------------------- */
+
 /* number of base blocks in a short period (low latency) */
 #define PERIOD_MULTIPLIER 32  /* 21 ms */
 /* number of frames per short period (low latency) */
@@ -68,6 +81,12 @@ struct alsa_audio_device {
     struct alsa_stream_in *active_input;
     struct alsa_stream_out *active_output;
     bool mic_mute;
+
+    /* HU mic FIFO injection */
+    int      hu_mic_fd;
+    uint8_t  hu_mic_buf[HU_MIC_BUF_SIZE];
+    uint32_t hu_mic_wr;
+    uint32_t hu_mic_rd;
 };
 
 struct alsa_stream_out {
@@ -540,7 +559,55 @@ static ssize_t in_read(struct audio_stream_in *stream, void* buffer,
 
     size_t in_frames = bytes / frame_size;
     ret = pcm_read(in->pcm, buffer, in_frames * frame_size);
-    if (ret == 0) 
+
+    /* ---- HU mic injection ------------------------------------------ */
+    /* Step 1: Drain the FIFO into the ring buffer (non-blocking). */
+    if (adev->hu_mic_fd >= 0) {
+        uint8_t tmp[512];
+        ssize_t n;
+        while (1) {
+            uint32_t avail_space = HU_MIC_BUF_SIZE -
+                    (adev->hu_mic_wr - adev->hu_mic_rd);
+            if (avail_space == 0) break;
+            size_t to_read = avail_space < sizeof(tmp) ? avail_space : sizeof(tmp);
+            n = read(adev->hu_mic_fd, tmp, to_read);
+            if (n <= 0) {
+                if (n < 0 && errno != EAGAIN && errno != EWOULDBLOCK) {
+                    /* Writer disconnected ΓÇö try to reopen for next connection */
+                    close(adev->hu_mic_fd);
+                    adev->hu_mic_fd = open(HU_MIC_FIFO_PATH,
+                                           O_RDONLY | O_NONBLOCK);
+                    ALOGD("hu_mic: pipe closed, reopened fd=%d", adev->hu_mic_fd);
+                }
+                break;
+            }
+            for (ssize_t i = 0; i < n; i++)
+                adev->hu_mic_buf[(adev->hu_mic_wr++) & HU_MIC_BUF_MASK] = tmp[i];
+        }
+    }
+
+    /* Step 2: If ring buffer has >= in_frames bytes of 24 kHz mono,
+     * upsample to 48 kHz stereo and overwrite the ALSA buffer. */
+    uint32_t hu_avail = adev->hu_mic_wr - adev->hu_mic_rd;
+    if (hu_avail >= (uint32_t)in_frames) {
+        /* Each input sample (24 kHz mono) ΓåÆ 2 output frames ├ù 2 ch = 4 s16s */
+        int16_t *out16 = (int16_t *)buffer;
+        size_t input_samples = in_frames / 2; /* = in_frames/2 @ 24kHz */
+        for (size_t i = 0; i < input_samples; i++) {
+            uint8_t lo = adev->hu_mic_buf[(adev->hu_mic_rd++) & HU_MIC_BUF_MASK];
+            uint8_t hi = adev->hu_mic_buf[(adev->hu_mic_rd++) & HU_MIC_BUF_MASK];
+            int16_t s = (int16_t)(lo | ((uint16_t)hi << 8));
+            /* Duplicate to 2 output frames (zero-order hold), stereo */
+            size_t j = i * 4;
+            out16[j + 0] = s;  /* frame 0, L */
+            out16[j + 1] = s;  /* frame 0, R */
+            out16[j + 2] = s;  /* frame 1, L */
+            out16[j + 3] = s;  /* frame 1, R */
+        }
+        ret = 0; /* override any ALSA error */
+    }
+    /* ---------------------------------------------------------------- */
+    if (ret == 0)
         in->read_frames += in_frames;
 exit:
     pthread_mutex_unlock(&in->lock);
@@ -809,6 +876,11 @@ static int adev_dump(const audio_hw_device_t *device, int fd)
 static int adev_close(hw_device_t *device)
 {
     ALOGV("adev_close");
+    struct alsa_audio_device *adev = (struct alsa_audio_device *)device;
+    if (adev->hu_mic_fd >= 0) {
+        close(adev->hu_mic_fd);
+        adev->hu_mic_fd = -1;
+    }
     free(device);
     return 0;
 }
@@ -854,6 +926,13 @@ static int adev_open(const hw_module_t* module, const char* name,
     adev->hw_device.dump = adev_dump;
 
     adev->devices = AUDIO_DEVICE_NONE;
+
+    /* Open read end of the HU mic FIFO non-blocking.
+     * The FIFO is created by init.rc at boot (as root). */
+    adev->hu_mic_fd = open(HU_MIC_FIFO_PATH, O_RDONLY | O_NONBLOCK);
+    adev->hu_mic_wr = 0;
+    adev->hu_mic_rd = 0;
+    ALOGI("hu_mic: FIFO %s opened fd=%d", HU_MIC_FIFO_PATH, adev->hu_mic_fd);
 
     *device = &adev->hw_device.common;
 

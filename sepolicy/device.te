@@ -1,1 +1,4 @@
 type cec_device, dev_type;
+
+# HU mic injection FIFO
+type hu_mic_device, dev_type;
