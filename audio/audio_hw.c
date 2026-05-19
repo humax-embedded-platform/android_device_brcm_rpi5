@@ -697,6 +697,35 @@ exit:
 static int do_input_standby(struct alsa_stream_in *in)
 {
     if (!in->standby) {
+        /* Drain FIFO and flush ring buffer */
+        struct alsa_audio_device *adev = in->dev;
+        size_t fifo_drained = 0;
+        uint32_t ring_pending = 0;
+
+        if (adev && adev->hu_mic_fd >= 0) {
+            uint8_t sink[512];
+            while (1) {
+                ssize_t n = read(adev->hu_mic_fd, sink, sizeof(sink));
+                if (n > 0) {
+                    fifo_drained += (size_t)n;
+                    /* Safety cap: do not spin forever if writer is flooding. */
+                    if (fifo_drained >= (HU_MIC_BUF_SIZE * 8u)) {
+                        break;
+                    }
+                    continue;
+                }
+                if (n < 0 && errno != EAGAIN && errno != EWOULDBLOCK) {
+                    ALOGW("hu_mic: FIFO discard read error: %s", strerror(errno));
+                }
+                break;
+            }
+            ring_pending = adev->hu_mic_wr - adev->hu_mic_rd;
+            adev->hu_mic_wr = 0;
+            adev->hu_mic_rd = 0;
+            ALOGI("hu_mic: reset on mic standby (ring_pending=%u bytes, fifo_discarded=%zu bytes)",
+                  ring_pending, fifo_drained);
+        }
+
         if (in->pcm) {
             pcm_close(in->pcm);
             in->pcm = NULL;
