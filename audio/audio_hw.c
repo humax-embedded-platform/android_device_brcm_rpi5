@@ -169,12 +169,11 @@ static int start_input_stream(struct alsa_stream_in *in) {
               in->config.period_size);
 
         in->pcm = pcm_open(card, device, PCM_IN, &in->config);
-        if(!pcm_is_ready(in->pcm)) {
-            ALOGE("start_input_stream: cannot open pcm_in card=%d device=%d: %s",
+        if (!pcm_is_ready(in->pcm)) {
+            ALOGE("start_input_stream: cannot open HDMI PCM card=%d device=%d: %s",
                   card, device, pcm_get_error(in->pcm));
             pcm_close(in->pcm);
-            in->pcm         = NULL;
-            in->unavailable = true;
+            in->pcm = NULL;
             return -ENODEV;
         }
         ALOGI("start_input_stream: opened HDMI PCM card=%d device=%d", card, device);
@@ -616,9 +615,13 @@ static ssize_t in_read(struct audio_stream_in *stream, void* buffer,
     // case HDIM
     if ((in->device & AUDIO_DEVICE_IN_HDMI) == AUDIO_DEVICE_IN_HDMI) {
         ret = pcm_read(in->pcm, buffer, in_frames * frame_size);
-        if (ret != 0 && in->pcm)
-            ALOGE("in_read: pcm_read failed: %s", pcm_get_error(in->pcm));
-
+        if (ret != 0) {
+            ALOGE("in_read: HDMI pcm_read failed: %s",
+                  in->pcm ? pcm_get_error(in->pcm) : "pcm=NULL");
+            pthread_mutex_lock(&adev->lock);
+            do_input_standby(in);
+            pthread_mutex_unlock(&adev->lock);
+        } 
     } else {
         /* ---- HU mic injection ------------------------------------------ */
         /* Step 1: Drain the FIFO into the ring buffer (non-blocking). */
@@ -726,39 +729,42 @@ static int do_input_standby(struct alsa_stream_in *in)
         size_t fifo_drained = 0;
         uint32_t ring_pending = 0;
 
-        if (adev && adev->hu_mic_fd >= 0) {
-            uint8_t sink[512];
-            while (1) {
-                ssize_t n = read(adev->hu_mic_fd, sink, sizeof(sink));
-                if (n > 0) {
-                    fifo_drained += (size_t)n;
-                    /* Safety cap: do not spin forever if writer is flooding. */
-                    if (fifo_drained >= (HU_MIC_BUF_SIZE * 8u)) {
-                        break;
+        /* Only touch HU mic state when this is the HU mic stream, not HDMI. */
+        if ((in->device & AUDIO_DEVICE_IN_HDMI) != AUDIO_DEVICE_IN_HDMI) {
+            if (adev && adev->hu_mic_fd >= 0) {
+                uint8_t sink[512];
+                while (1) {
+                    ssize_t n = read(adev->hu_mic_fd, sink, sizeof(sink));
+                    if (n > 0) {
+                        fifo_drained += (size_t)n;
+                        /* Safety cap: do not spin forever if writer is flooding. */
+                        if (fifo_drained >= (HU_MIC_BUF_SIZE * 8u)) {
+                            break;
+                        }
+                        continue;
                     }
-                    continue;
+                    if (n < 0 && errno != EAGAIN && errno != EWOULDBLOCK) {
+                        ALOGW("hu_mic: FIFO discard read error: %s", strerror(errno));
+                    }
+                    break;
                 }
-                if (n < 0 && errno != EAGAIN && errno != EWOULDBLOCK) {
-                    ALOGW("hu_mic: FIFO discard read error: %s", strerror(errno));
-                }
-                break;
+                ring_pending = adev->hu_mic_wr - adev->hu_mic_rd;
+                adev->hu_mic_wr = 0;
+                adev->hu_mic_rd = 0;
+                ALOGI("hu_mic: reset on mic standby (ring_pending=%u bytes, fifo_discarded=%zu bytes)",
+                      ring_pending, fifo_drained);
             }
-            ring_pending = adev->hu_mic_wr - adev->hu_mic_rd;
-            adev->hu_mic_wr = 0;
-            adev->hu_mic_rd = 0;
-            ALOGI("hu_mic: reset on mic standby (ring_pending=%u bytes, fifo_discarded=%zu bytes)",
-                  ring_pending, fifo_drained);
         }
 
         if (in->pcm) {
             pcm_close(in->pcm);
             in->pcm = NULL;
         }
-        if (in->dump_fd >= 0) {
-            close(in->dump_fd);
-            in->dump_fd = -1;
-        }
-        in->dev->active_input = NULL;
+
+        /* Only clear active_input if it still points to this stream. */
+        if (adev->active_input == in)
+            adev->active_input = NULL;
+
         in->standby = 1;
     }
     return 0;
