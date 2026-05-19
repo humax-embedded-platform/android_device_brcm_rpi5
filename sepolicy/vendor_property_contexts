@@ -1,0 +1,5 @@
+persist.audio.hdmi.device    u:object_r:vendor_audio_prop:s0 exact string
+persist.audio.pcm.card       u:object_r:vendor_audio_prop:s0 exact int
+persist.audio.pcm.card.auto  u:object_r:vendor_audio_prop:s0 exact bool
+persist.audio.pcm.device     u:object_r:vendor_audio_prop:s0 exact int
+debug.vendor.gpu.record_sbwc u:object_r:gpu_debug_prop:s0
