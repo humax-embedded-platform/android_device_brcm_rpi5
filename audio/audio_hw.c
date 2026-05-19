@@ -121,6 +121,7 @@ struct alsa_stream_in {
     struct alsa_audio_device *dev;
     unsigned int read_frames;
     audio_devices_t device;
+    int dump_fd;  /* -1 when disabled; toggled by prop audio_hal_dump */
 };
 
 struct pcm_config in_config = {
@@ -134,6 +135,7 @@ struct pcm_config in_config = {
 
 static int get_pcm_card();
 static int get_pcm_device();
+static void in_dump_write(struct alsa_stream_in *in, const void *buf, size_t bytes);
 static int do_input_standby(struct alsa_stream_in *in);
 static int do_output_standby(struct alsa_stream_out *out);
 static int get_input_pcm_device(audio_devices_t device);
@@ -674,12 +676,13 @@ static ssize_t in_read(struct audio_stream_in *stream, void* buffer,
             }
             ret = 0;
         } else {
-            /* No FIFO data — (returns silence). */
-            ALOG_RATELIMIT(300, "in_read", "HU mic starved (avail=%u < need=%zu), pcm_read fallback",
+            /* No FIFO data — exit path will sleep + zero the buffer. */
+            ALOG_RATELIMIT(300, "in_read", "HU mic starved (avail=%u < need=%zu)",
                         hu_avail, in_frames);
             ret = -1;
         }
-        /* Rate-limit to real time: in_frames @ 48 kHz */
+        /* For the success path only: pace to real time so we don't spin.
+         * The starved path is already paced by the exit-block usleep below. */
         usleep((long)in_frames * 1000000L / CODEC_SAMPLING_RATE);
     }
 
@@ -691,7 +694,28 @@ exit:
                 in_get_sample_rate(&stream->common));
         memset(buffer, 0, bytes);
     }
+
+    in_dump_write(in, buffer, bytes);
     return bytes;
+}
+
+static void in_dump_write(struct alsa_stream_in *in, const void *buf, size_t bytes)
+{
+    char prop[PROPERTY_VALUE_MAX];
+    property_get("audio_hal_dump", prop, "0");
+    if (prop[0] == '1') {
+        if (in->dump_fd < 0) {
+            in->dump_fd = open("/data/misc/audioserver/hu_mic_dump.pcm",
+                               O_WRONLY | O_CREAT | O_TRUNC, 0644);
+            ALOGI("in_dump: started fd=%d", in->dump_fd);
+        }
+    } else if (in->dump_fd >= 0) {
+        ALOGI("in_dump: stopped");
+        close(in->dump_fd);
+        in->dump_fd = -1;
+    }
+    if (in->dump_fd >= 0)
+        write(in->dump_fd, buf, bytes);
 }
 
 static int do_input_standby(struct alsa_stream_in *in)
@@ -730,7 +754,10 @@ static int do_input_standby(struct alsa_stream_in *in)
             pcm_close(in->pcm);
             in->pcm = NULL;
         }
-        
+        if (in->dump_fd >= 0) {
+            close(in->dump_fd);
+            in->dump_fd = -1;
+        }
         in->dev->active_input = NULL;
         in->standby = 1;
     }
@@ -951,6 +978,7 @@ static int adev_open_input_stream(struct audio_hw_device *dev,
     in->dev = ladev;
     in->standby = 1;
     in->config = in_config;
+    in->dump_fd = -1;
 
     ALOGI("adev_open_input_stream: device=0x%08x rate=%u ch_mask=0x%x fmt=%d flags=0x%x",
           devices, config->sample_rate, config->channel_mask, config->format, flags);
