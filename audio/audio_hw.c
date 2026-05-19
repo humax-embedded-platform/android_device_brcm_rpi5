@@ -1009,7 +1009,7 @@ static int adev_open(const hw_module_t* module, const char* name,
 
     /* Open read end of the HU mic FIFO non-blocking.
      * The FIFO is created by init.rc at boot (as root). */
-    adev->hu_mic_fd = -1;
+    adev->hu_mic_fd = open(HU_MIC_FIFO_PATH, O_RDONLY | O_NONBLOCK);
     adev->hu_mic_wr = 0;
     adev->hu_mic_rd = 0;
     ALOGI("hu_mic: FIFO %s opened fd=%d", HU_MIC_FIFO_PATH, adev->hu_mic_fd);

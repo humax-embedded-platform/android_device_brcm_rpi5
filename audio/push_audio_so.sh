@@ -4,6 +4,7 @@
 set -e
 
 DEVICE_LIB_PATH="/vendor/lib/hw"
+DEVICE_LIB64_PATH="/vendor/lib64/hw"
 DEVICE_ETC_PATH="/vendor/etc"
 AOSP_OUT="${ANDROID_PRODUCT_OUT:-}"
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
@@ -21,17 +22,17 @@ XML_DST="$DEVICE_ETC_PATH/audio_policy_configuration.xml"
 die() { echo "ERROR: $*" >&2; exit 1; }
 
 find_so() {
-    local name="$1"
+    local name="$1" bitness="$2"   # bitness: lib or lib64
     if [[ -n "$AOSP_OUT" ]]; then
-        local p="$AOSP_OUT/vendor/lib/hw/$name"
+        local p="$AOSP_OUT/vendor/$bitness/hw/$name"
         [[ -f "$p" ]] && { echo "$p"; return; }
     fi
     local root
     root="$(cd "$SCRIPT_DIR/../../../.." && pwd)"   # device/brcm/rpi4/audio -> root
     local found
-    found="$(find "$root/out" -name "$name" -path "*/vendor/lib/hw/*" 2>/dev/null | head -n1)"
+    found="$(find "$root/out" -name "$name" -path "*/vendor/$bitness/hw/*" 2>/dev/null | head -n1)"
     [[ -n "$found" ]] && { echo "$found"; return; }
-    die "Cannot find $name. Set ANDROID_PRODUCT_OUT or run from AOSP root after a build."
+    return 1
 }
 
 push_xml() {
@@ -59,11 +60,11 @@ remount_vendor() {
 }
 
 push_lib() {
-    local src="$1" name
+    local src="$1" dst="$2" name
     name="$(basename "$src")"
-    echo "Pushing $name  ->  $DEVICE_LIB_PATH/$name"
-    adb push "$src" "$DEVICE_LIB_PATH/$name"
-    adb shell chmod 644 "$DEVICE_LIB_PATH/$name"
+    echo "Pushing $name  ->  $dst/$name"
+    adb push "$src" "$dst/$name"
+    adb shell chmod 644 "$dst/$name"
 }
 
 # --- parse args ---
@@ -112,8 +113,11 @@ check_adb
 remount_vendor
 
 for lib in "${SELECT[@]}"; do
-    src="$(find_so "$lib")"
-    push_lib "$src"
+    src32="$(find_so "$lib" lib)"   || true
+    src64="$(find_so "$lib" lib64)" || true
+    [[ -z "$src32" && -z "$src64" ]] && die "Cannot find $lib. Set ANDROID_PRODUCT_OUT or run from AOSP root after a build."
+    [[ -n "$src32" ]] && push_lib "$src32" "$DEVICE_LIB_PATH"
+    [[ -n "$src64" ]] && push_lib "$src64" "$DEVICE_LIB64_PATH"
 done
 
 $PUSH_XML && push_xml
