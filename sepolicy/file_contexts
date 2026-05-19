@@ -54,3 +54,9 @@
 
 # USB
 /vendor/bin/hw/android\.hardware\.usb\.gadget-service\.rpi                   u:object_r:hal_usb_gadget_default_exec:s0
+
+# V4L2 / Camera
+/dev/media[0-9]*                                      u:object_r:video_device:s0
+
+/sys/bus/media(/.*)?                                  u:object_r:sysfs_camera:s0
+/sys/devices/.*/video4linux(/.*)?                     u:object_r:sysfs_camera:s0

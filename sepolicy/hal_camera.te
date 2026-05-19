@@ -1,3 +1,5 @@
+type sysfs_camera, fs_type, sysfs_type;
+
 vndbinder_use(hal_camera_default);
 
 allow hal_camera_default hal_graphics_mapper_hwservice:hwservice_manager find;
@@ -10,3 +12,7 @@ allow cameraserver video_device:chr_file rw_file_perms;
 
 gpu_access(hal_camera_default)
 gpu_access(cameraserver)
+
+allow hal_camera_default video_device:chr_file rw_file_perms;
+
+r_dir_file(hal_camera_default, sysfs_camera)
