@@ -27,6 +27,10 @@ dtoverlay=tc358743-audio
 # I2S
 #dtparam=i2s=on
 
+# PCIe
+dtparam=nvme
+dtparam=pciex1_gen=3
+
 # SPI
 #dtparam=spi=on
 

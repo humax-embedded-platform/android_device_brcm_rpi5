@@ -11,3 +11,9 @@ on post-fs-data
     mkdir /data/vendor/wifi 0770 wifi wifi
     mkdir /data/vendor/wifi/wpa 0770 wifi wifi
     mkdir /data/vendor/wifi/wpa/sockets 0770 wifi wifi
+
+on property:sys.boot_completed=1
+    # Enable BT kernel debug logging
+    write /sys/kernel/debug/dynamic_debug/control "module bluetooth +pflmt"
+    write /sys/kernel/debug/dynamic_debug/control "module btusb +pflmt"
+    write /sys/kernel/debug/dynamic_debug/control "module btbcm +pflmt"
