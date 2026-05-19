@@ -618,9 +618,6 @@ static ssize_t in_read(struct audio_stream_in *stream, void* buffer,
         if (ret != 0) {
             ALOGE("in_read: HDMI pcm_read failed: %s",
                   in->pcm ? pcm_get_error(in->pcm) : "pcm=NULL");
-            pthread_mutex_lock(&adev->lock);
-            do_input_standby(in);
-            pthread_mutex_unlock(&adev->lock);
         } 
     } else {
         /* ---- HU mic injection ------------------------------------------ */
