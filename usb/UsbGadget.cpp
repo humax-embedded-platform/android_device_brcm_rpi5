@@ -34,9 +34,30 @@ namespace usb {
 namespace gadget {
 
 UsbGadget::UsbGadget() {
+    /*
+        The configfs gadget tree (/config/usb_gadget/g1/...) is built by
+        init.rpi5.usb.rc. On a cold boot — especially headless, where the
+        bootloader skips the ~2-3s HDMI EDID negotiation — this HAL can start
+        before init finishes its mkdir/write chain, leaving OS_DESC_PATH absent.
+        
+        Aborting here used to cascade into a system_server / zygote restart
+        loop (HAL down → UsbService can't bind → FATAL EXCEPTION in
+        system_server → ZygoteCommandBuffer read fails → SIGABRT). Wait for the
+        path instead and, on timeout, log a warning and continue so the service
+        stays up; subsequent configfs writes will surface errors cleanly.
+    */
+    constexpr int kMaxWaitMs = 10000;
+    constexpr int kStepMs    = 100;
+    int waited = 0;
+    while (access(OS_DESC_PATH, R_OK) != 0 && waited < kMaxWaitMs) {
+        usleep(kStepMs * 1000);
+        waited += kStepMs;
+    }
     if (access(OS_DESC_PATH, R_OK) != 0) {
-        ALOGE("configfs setup not done yet");
-        abort();
+        ALOGE("configfs %s not ready after %d ms — continuing without abort",
+              OS_DESC_PATH, waited);
+    } else if (waited > 0) {
+        ALOGI("configfs %s ready after %d ms", OS_DESC_PATH, waited);
     }
 }
 

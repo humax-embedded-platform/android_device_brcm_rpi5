@@ -229,6 +229,22 @@ Return<void> HdmiCec::getPortInfo(getPortInfo_cb callback) {
     if (ret) {
         LOG(ERROR) << "Get port info failed for port : " << mHdmiCecPorts[0]->mPortId
                    << ", Error = " << strerror(errno);
+        addr = CEC_PHYS_ADDR_INVALID;
+    }
+    /**
+        HIDL Java binding gotcha: uint16_t -> Java short (signed 16-bit) ->
+        sign-extended to int. Any uint16 with the high bit set (0x8000+) becomes
+        a NEGATIVE int in Java, and HdmiPortInfo.Builder throws
+        IllegalArgumentException("address should be positive.") on negatives —
+        killing system_server -> boot loop. The kernel CEC adapter returns
+        CEC_PHYS_ADDR_INVALID (0xFFFF) when no HDMI sink is attached, hitting
+        exactly this case. Map any high-bit value to 0 (which Java widens to a
+        positive int) so the framework accepts the port info instead of crashing.
+    */
+    if (addr & 0x8000) {
+        LOG(WARNING) << "[PDT] physicalAddress 0x" << std::hex << addr
+                     << std::dec << " has high bit set; coerce to 0 (no sink)";
+        addr = 0;
     }
 
     hidl_vec<HdmiPortInfo> portInfos {
