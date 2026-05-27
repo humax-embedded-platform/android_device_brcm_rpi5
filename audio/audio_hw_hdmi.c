@@ -16,12 +16,22 @@
  */
 
 #define LOG_TAG "audio_hw_rpi_hdmi"
-//#define LOG_NDEBUG 0
+#define LOG_NDEBUG 0
+
+/* Rate-limited log: prints every N calls. Use for hot-path functions. */
+#define ALOG_RATELIMIT(n, tag, fmt, ...) \
+    do { \
+        static unsigned _rl_ctr = 0; \
+        if ((_rl_ctr++ % (n)) == 0) \
+            ALOGD("[%s #%u] " fmt, tag, _rl_ctr, ##__VA_ARGS__); \
+    } while (0)
 
 #include <errno.h>
+#include <fcntl.h>
 #include <malloc.h>
 #include <pthread.h>
 #include <stdint.h>
+#include <sys/stat.h>
 #include <sys/time.h>
 #include <stdlib.h>
 #include <unistd.h>
@@ -44,6 +54,17 @@
 /* Minimum granularity - Arbitrary but small value */
 #define CODEC_BASE_FRAME_COUNT 32
 
+/* HU mic injection via named FIFO --------------------------------------- */
+#define HU_MIC_FIFO_PATH    "/dev/hu_mic"
+/* Ring buffer: power-of-2, holds ~16 periods of 24 kHz mono input.
+ * HU mic: 24 kHz mono s16-LE = 2 bytes/sample.
+ * One 48 kHz output period (PERIOD_SIZE frames, stereo) needs
+ * PERIOD_SIZE/2 input samples = PERIOD_SIZE bytes from this buffer. */
+#define HU_MIC_BUF_BITS     14
+#define HU_MIC_BUF_SIZE     (1u << HU_MIC_BUF_BITS)  /* 16384 bytes */
+#define HU_MIC_BUF_MASK     (HU_MIC_BUF_SIZE - 1u)
+/* ------------------------------------------------------------------- */
+
 /* number of base blocks in a short period (low latency) */
 #define PERIOD_MULTIPLIER 32  /* 21 ms */
 /* number of frames per short period (low latency) */
@@ -57,10 +78,6 @@
 
 char device_name[PROPERTY_VALUE_MAX];
 
-struct stub_stream_in {
-    struct audio_stream_in stream;
-};
-
 struct alsa_audio_device {
     struct audio_hw_device hw_device;
 
@@ -69,6 +86,30 @@ struct alsa_audio_device {
     struct alsa_stream_in *active_input;
     struct alsa_stream_out *active_output;
     bool mic_mute;
+
+    /* HU mic FIFO injection */
+    int      hu_mic_fd;
+    uint8_t  hu_mic_buf[HU_MIC_BUF_SIZE];
+    uint32_t hu_mic_wr;
+    uint32_t hu_mic_rd;
+};
+
+struct alsa_stream_in {
+    struct audio_stream_in stream;
+
+    pthread_mutex_t lock;
+    /* Mic input pipeline is purely the HU FIFO injection — no ALSA capture
+     * device is opened here (the HDMI variant has no analog mic). Values
+     * mirror what the HU mic patch in audio_hw.c upsamples to. */
+    uint32_t sample_rate;   /* 48000 */
+    uint32_t channels;      /* 2 (stereo) */
+    size_t   period_size;   /* PERIOD_SIZE */
+    bool unavailable;
+    int standby;
+    struct alsa_audio_device *dev;
+    unsigned int read_frames;
+    audio_devices_t device;
+    int dump_fd;            /* -1 when disabled; toggled by prop audio_hal_dump */
 };
 
 struct alsa_stream_out {
@@ -428,11 +469,49 @@ static int out_get_next_write_timestamp(const struct audio_stream_out *stream,
     return -EINVAL;
 }
 
+/* HU mic helpers — ported from audio_hw.c (rpi variant). The HDMI variant
+ * has no ALSA capture device, so the input pipeline is purely the FIFO
+ * injection: in_read drains /dev/hu_mic into a ring buffer and upsamples
+ * 24 kHz mono → 48 kHz stereo for AudioFlinger.
+ */
+static void in_dump_write(struct alsa_stream_in *in, const void *buf, size_t bytes);
+static int do_input_standby(struct alsa_stream_in *in);
+
+static int start_input_stream(struct alsa_stream_in *in) {
+    struct alsa_audio_device *adev = in->dev;
+
+    ALOGD("start_input_stream: device=0x%08x unavailable=%d standby=%d",
+          in->device, in->unavailable, in->standby);
+
+    if (in->unavailable) {
+        return -ENODEV;
+    }
+
+    ALOGD("start_input_stream: HU mic path, current fd=%d", adev->hu_mic_fd);
+    if (adev->hu_mic_fd < 0) {
+        adev->hu_mic_fd = open(HU_MIC_FIFO_PATH, O_RDONLY | O_NONBLOCK);
+        if (adev->hu_mic_fd < 0)
+            ALOGE("start_input_stream: failed to open %s: %s",
+                  HU_MIC_FIFO_PATH, strerror(errno));
+        else
+            ALOGI("start_input_stream: opened HU mic FIFO %s fd=%d",
+                  HU_MIC_FIFO_PATH, adev->hu_mic_fd);
+    } else {
+        ALOGD("start_input_stream: HU mic FIFO already open fd=%d", adev->hu_mic_fd);
+    }
+    ALOGD("start_input_stream: ring buf wr=%u rd=%u avail=%u",
+          adev->hu_mic_wr, adev->hu_mic_rd,
+          adev->hu_mic_wr - adev->hu_mic_rd);
+
+    adev->active_input = in;
+    return 0;
+}
+
 /** audio_stream_in implementation **/
 static uint32_t in_get_sample_rate(const struct audio_stream *stream)
 {
-    ALOGV("in_get_sample_rate");
-    return 8000;
+    struct alsa_stream_in *in = (struct alsa_stream_in *)stream;
+    return in->sample_rate ? in->sample_rate : 48000;
 }
 
 static int in_set_sample_rate(struct audio_stream *stream, uint32_t rate)
@@ -443,14 +522,16 @@ static int in_set_sample_rate(struct audio_stream *stream, uint32_t rate)
 
 static size_t in_get_buffer_size(const struct audio_stream *stream)
 {
-    ALOGV("in_get_buffer_size: %d", 320);
-    return 320;
+    struct alsa_stream_in *in = (struct alsa_stream_in *)stream;
+    size_t period = in->period_size ? in->period_size : PERIOD_SIZE;
+    size_t size = ((period + 15) / 16) * 16;
+    return size * audio_stream_in_frame_size((struct audio_stream_in *)stream);
 }
 
 static audio_channel_mask_t in_get_channels(const struct audio_stream *stream)
 {
-    ALOGV("in_get_channels: %d", AUDIO_CHANNEL_IN_MONO);
-    return AUDIO_CHANNEL_IN_MONO;
+    struct alsa_stream_in *in = (struct alsa_stream_in *)stream;
+    return audio_channel_in_mask_from_count(in->channels ? in->channels : 2);
 }
 
 static audio_format_t in_get_format(const struct audio_stream *stream)
@@ -465,7 +546,13 @@ static int in_set_format(struct audio_stream *stream, audio_format_t format)
 
 static int in_standby(struct audio_stream *stream)
 {
-    return 0;
+    struct alsa_stream_in *in = (struct alsa_stream_in *)stream;
+    pthread_mutex_lock(&in->dev->lock);
+    pthread_mutex_lock(&in->lock);
+    int status = do_input_standby(in);
+    pthread_mutex_unlock(&in->lock);
+    pthread_mutex_unlock(&in->dev->lock);
+    return status;
 }
 
 static int in_dump(const struct audio_stream *stream, int fd)
@@ -492,12 +579,162 @@ static int in_set_gain(struct audio_stream_in *stream, float gain)
 static ssize_t in_read(struct audio_stream_in *stream, void* buffer,
         size_t bytes)
 {
-    ALOGV("in_read: bytes %zu", bytes);
-    /* XXX: fake timing for audio input */
-    usleep((int64_t)bytes * 1000000 / audio_stream_in_frame_size(stream) /
-            in_get_sample_rate(&stream->common));
-    memset(buffer, 0, bytes);
+    struct alsa_stream_in *in = (struct alsa_stream_in *)stream;
+    struct alsa_audio_device *adev = in->dev;
+    size_t frame_size = audio_stream_in_frame_size(stream);
+    ssize_t ret = 0;
+    ALOG_RATELIMIT(300, "in_read", "bytes=%zu", bytes);
+    pthread_mutex_lock(&adev->lock);
+    pthread_mutex_lock(&in->lock);
+
+    if (in->standby) {
+        ret = start_input_stream(in);
+        if (ret != 0) {
+            pthread_mutex_unlock(&adev->lock);
+            goto exit;
+        }
+        in->standby = 0;
+    }
+    pthread_mutex_unlock(&adev->lock);
+
+    size_t in_frames = bytes / frame_size;
+
+    /* ---- HU mic injection ------------------------------------------ */
+    /* Step 1: Drain the FIFO into the ring buffer (non-blocking). */
+    if (adev->hu_mic_fd >= 0) {
+        uint8_t tmp[512];
+        ssize_t n;
+        while (1) {
+            uint32_t avail_space = HU_MIC_BUF_SIZE -
+                    (adev->hu_mic_wr - adev->hu_mic_rd);
+            if (avail_space == 0) break;
+            size_t to_read = avail_space < sizeof(tmp) ? avail_space : sizeof(tmp);
+            n = read(adev->hu_mic_fd, tmp, to_read);
+            if (n <= 0) {
+                if (n < 0 && errno != EAGAIN && errno != EWOULDBLOCK) {
+                    /* Writer disconnected — try to reopen for next connection */
+                    close(adev->hu_mic_fd);
+                    adev->hu_mic_fd = open(HU_MIC_FIFO_PATH,
+                                        O_RDONLY | O_NONBLOCK);
+                    ALOGD("hu_mic: pipe closed, reopened fd=%d", adev->hu_mic_fd);
+                }
+                break;
+            }
+            for (ssize_t i = 0; i < n; i++)
+                adev->hu_mic_buf[(adev->hu_mic_wr++) & HU_MIC_BUF_MASK] = tmp[i];
+        }
+    }
+
+    /* Step 2: If ring buffer has >= in_frames bytes of 24 kHz mono,
+     * upsample to 48 kHz stereo and overwrite the ALSA buffer. */
+    uint32_t hu_avail = adev->hu_mic_wr - adev->hu_mic_rd;
+    ALOG_RATELIMIT(100, "in_read",
+                "hu_mic fd=%d avail=%u in_frames=%zu buf_fill=%.1f%%",
+                adev->hu_mic_fd, hu_avail, in_frames,
+                100.0f * hu_avail / HU_MIC_BUF_SIZE);
+    if (hu_avail >= (uint32_t)in_frames) {
+        /* Each input sample (24 kHz mono) -> 2 output frames x 2 ch = 4 s16s */
+        int16_t *out16 = (int16_t *)buffer;
+        size_t input_samples = in_frames / 2; /* = in_frames/2 @ 24kHz */
+        for (size_t i = 0; i < input_samples; i++) {
+            uint8_t lo = adev->hu_mic_buf[(adev->hu_mic_rd++) & HU_MIC_BUF_MASK];
+            uint8_t hi = adev->hu_mic_buf[(adev->hu_mic_rd++) & HU_MIC_BUF_MASK];
+            int16_t s = (int16_t)(lo | ((uint16_t)hi << 8));
+            /* Gain boost: HU mic signal is very quiet (~1% full-scale).
+             * Amplify 20x (~26 dB) to bring speech into recognisable range. */
+            int32_t s_amp = (int32_t)s * 20;
+            if      (s_amp >  32767) s_amp =  32767;
+            else if (s_amp < -32768) s_amp = -32768;
+            s = (int16_t)s_amp;
+            /* Duplicate to 2 output frames (zero-order hold), stereo */
+            size_t j = i * 4;
+            out16[j + 0] = s;  /* frame 0, L */
+            out16[j + 1] = s;  /* frame 0, R */
+            out16[j + 2] = s;  /* frame 1, L */
+            out16[j + 3] = s;  /* frame 1, R */
+        }
+        ret = 0;
+    } else {
+        /* No FIFO data — exit path will sleep + zero the buffer. */
+        ALOG_RATELIMIT(300, "in_read", "HU mic starved (avail=%u < need=%zu)",
+                    hu_avail, in_frames);
+        ret = -1;
+    }
+    /* For the success path only: pace to real time so we don't spin.
+     * The starved path is already paced by the exit-block usleep below. */
+    usleep((long)in_frames * 1000000L / CODEC_SAMPLING_RATE);
+
+exit:
+    pthread_mutex_unlock(&in->lock);
+
+    if (ret != 0) {
+        usleep((int64_t)bytes * 1000000 / frame_size /
+                in_get_sample_rate(&stream->common));
+        memset(buffer, 0, bytes);
+    }
+
+    in_dump_write(in, buffer, bytes);
     return bytes;
+}
+
+static void in_dump_write(struct alsa_stream_in *in, const void *buf, size_t bytes)
+{
+    char prop[PROPERTY_VALUE_MAX];
+    property_get("audio_hal_dump", prop, "0");
+    if (prop[0] == '1') {
+        if (in->dump_fd < 0) {
+            in->dump_fd = open("/data/misc/audioserver/hu_mic_dump.pcm",
+                               O_WRONLY | O_CREAT | O_TRUNC, 0644);
+            ALOGI("in_dump: started fd=%d", in->dump_fd);
+        }
+    } else if (in->dump_fd >= 0) {
+        ALOGI("in_dump: stopped");
+        close(in->dump_fd);
+        in->dump_fd = -1;
+    }
+    if (in->dump_fd >= 0)
+        write(in->dump_fd, buf, bytes);
+}
+
+static int do_input_standby(struct alsa_stream_in *in)
+{
+    if (!in->standby) {
+        /* Drain FIFO and flush ring buffer */
+        struct alsa_audio_device *adev = in->dev;
+        size_t fifo_drained = 0;
+        uint32_t ring_pending = 0;
+
+        if (adev && adev->hu_mic_fd >= 0) {
+            uint8_t sink[512];
+            while (1) {
+                ssize_t n = read(adev->hu_mic_fd, sink, sizeof(sink));
+                if (n > 0) {
+                    fifo_drained += (size_t)n;
+                    /* Safety cap: do not spin forever if writer is flooding. */
+                    if (fifo_drained >= (HU_MIC_BUF_SIZE * 8u)) {
+                        break;
+                    }
+                    continue;
+                }
+                if (n < 0 && errno != EAGAIN && errno != EWOULDBLOCK) {
+                    ALOGW("hu_mic: FIFO discard read error: %s", strerror(errno));
+                }
+                break;
+            }
+            ring_pending = adev->hu_mic_wr - adev->hu_mic_rd;
+            adev->hu_mic_wr = 0;
+            adev->hu_mic_rd = 0;
+            ALOGI("hu_mic: reset on mic standby (ring_pending=%u bytes, fifo_discarded=%zu bytes)",
+                  ring_pending, fifo_drained);
+        }
+
+        /* Only clear active_input if it still points to this stream. */
+        if (adev->active_input == in)
+            adev->active_input = NULL;
+
+        in->standby = 1;
+    }
+    return 0;
 }
 
 static uint32_t in_get_input_frames_lost(struct audio_stream_in *stream)
@@ -646,14 +883,22 @@ static int adev_get_mic_mute(const struct audio_hw_device *dev, bool *state)
     return -ENOSYS;
 }
 
-static size_t adev_get_input_buffer_size(const struct audio_hw_device *dev,
+static size_t adev_get_input_buffer_size(const struct audio_hw_device *dev __unused,
         const struct audio_config *config)
 {
-    ALOGV("adev_get_input_buffer_size: %d", 320);
-    return 320;
+    size_t channels = audio_channel_count_from_in_mask(config->channel_mask);
+    size_t bytes_per_sample = audio_bytes_per_sample(config->format);
+    if (channels == 0) channels = CHANNEL_STEREO;
+    if (bytes_per_sample == 0) bytes_per_sample = 2;
+    size_t size = PERIOD_SIZE * channels * bytes_per_sample;
+    /* round to a multiple of 16 frames as AudioFlinger expects */
+    size = ((size + 15) / 16) * 16;
+    ALOGV("adev_get_input_buffer_size: %zu (ch=%zu bps=%zu)",
+          size, channels, bytes_per_sample);
+    return size;
 }
 
-static int adev_open_input_stream(struct audio_hw_device __unused *dev,
+static int adev_open_input_stream(struct audio_hw_device *dev,
         audio_io_handle_t handle,
         audio_devices_t devices,
         struct audio_config *config,
@@ -662,11 +907,13 @@ static int adev_open_input_stream(struct audio_hw_device __unused *dev,
         const char *address __unused,
         audio_source_t source __unused)
 {
-    struct stub_stream_in *in;
+    struct alsa_audio_device *ladev = (struct alsa_audio_device *)dev;
+    struct alsa_stream_in *in;
 
-    ALOGV("adev_open_input_stream...");
+    ALOGI("adev_open_input_stream: devices=0x%08x req sr=%u ch=0x%x fmt=%d",
+          devices, config->sample_rate, config->channel_mask, config->format);
 
-    in = (struct stub_stream_in *)calloc(1, sizeof(struct stub_stream_in));
+    in = (struct alsa_stream_in *)calloc(1, sizeof(struct alsa_stream_in));
     if (!in)
         return -ENOMEM;
 
@@ -686,15 +933,35 @@ static int adev_open_input_stream(struct audio_hw_device __unused *dev,
     in->stream.read = in_read;
     in->stream.get_input_frames_lost = in_get_input_frames_lost;
 
+    in->dev = ladev;
+    in->standby = 1;
+    in->unavailable = false;
+    in->device = devices;
+    in->sample_rate = CODEC_SAMPLING_RATE;          /* 48000 */
+    in->channels = CHANNEL_STEREO;                  /* 2 */
+    in->period_size = PERIOD_SIZE;
+    in->dump_fd = -1;
+
+    /* Force the framework to use the format the HU mic pipeline produces. */
+    config->sample_rate = CODEC_SAMPLING_RATE;
+    config->channel_mask = AUDIO_CHANNEL_IN_STEREO;
+    config->format = AUDIO_FORMAT_PCM_16_BIT;
+
     *stream_in = &in->stream;
     return 0;
 }
 
-static void adev_close_input_stream(struct audio_hw_device *dev,
-        struct audio_stream_in *in)
+static void adev_close_input_stream(struct audio_hw_device *dev __unused,
+        struct audio_stream_in *stream)
 {
-    ALOGV("adev_close_input_stream...");
-    return;
+    struct alsa_stream_in *in = (struct alsa_stream_in *)stream;
+    ALOGI("adev_close_input_stream");
+    do_input_standby(in);
+    if (in->dump_fd >= 0) {
+        close(in->dump_fd);
+        in->dump_fd = -1;
+    }
+    free(in);
 }
 
 static int adev_dump(const audio_hw_device_t *device, int fd)
@@ -705,7 +972,14 @@ static int adev_dump(const audio_hw_device_t *device, int fd)
 
 static int adev_close(hw_device_t *device)
 {
-    ALOGV("adev_close");
+    struct alsa_audio_device *adev = (struct alsa_audio_device *)device;
+    ALOGI("adev_close");
+    if (adev) {
+        if (adev->hu_mic_fd >= 0) {
+            close(adev->hu_mic_fd);
+            adev->hu_mic_fd = -1;
+        }
+    }
     free(device);
     return 0;
 }
@@ -750,6 +1024,21 @@ static int adev_open(const hw_module_t* module, const char* name,
     adev->hw_device.dump = adev_dump;
 
     adev->devices = AUDIO_DEVICE_NONE;
+
+    /* Open HU mic FIFO at HAL startup so the writer side (HuMicLocalBridge)
+     * doesn't see EAGAIN before the first AudioRecord is created. The
+     * reader-side fd is held until adev_close even when no input stream
+     * is active — drain happens at standby/start. */
+    adev->hu_mic_fd = open(HU_MIC_FIFO_PATH, O_RDONLY | O_NONBLOCK);
+    if (adev->hu_mic_fd < 0) {
+        ALOGW("adev_open: HU mic FIFO %s not openable yet (%s) — will retry on input start",
+              HU_MIC_FIFO_PATH, strerror(errno));
+    } else {
+        ALOGI("adev_open: HU mic FIFO %s opened fd=%d",
+              HU_MIC_FIFO_PATH, adev->hu_mic_fd);
+    }
+    adev->hu_mic_wr = 0;
+    adev->hu_mic_rd = 0;
 
     *device = &adev->hw_device.common;
 
